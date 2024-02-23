@@ -1,10 +1,10 @@
 package internal
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -12,14 +12,11 @@ type FindOptions struct {
 	// The name of the image to find.
 	Name string
 
-	// The tag of the image.
-	Tag string
+	// The maximum number of images to return.
+	Page int
 
-	// The number of images to return.
-	Limit int
-
-	// The date the image was created after.
-	After time.Time
+	// The number of images to return per page.
+	PageSize int
 }
 
 // Image represents a Docker image.
@@ -40,39 +37,36 @@ type Image struct {
 	Digest string
 }
 
-// FindImages returns a list of images that match the given options.
-func FindImages(opts FindOptions) ([]Image, error) {
-	// If the name is empty, return an error.
-	if opts.Name == "" {
-		return nil, fmt.Errorf("name is required")
-	}
+type FindFunc func() ([]Image, FindFunc, error)
 
-	// If the limit is less than 1, return an empty list.
-	if opts.Limit < 1 {
-		return nil, nil
-	}
+func nextFindFunc(ctx context.Context, name string, url string) FindFunc {
+	return func() ([]Image, FindFunc, error) {
+		images, next, err := fetchImages(ctx, name, url)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to fetch images: %w", err)
+		}
 
-	// Fetch the images from the Docker Hub API.
-	images, err := fetchImages(opts.Name)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch images: %w", err)
+		return images, nextFindFunc(ctx, name, next), nil
 	}
-
-	// Return the list of images.
-	return filterImages(images, opts), nil
 }
 
-func fetchImages(repository string) ([]Image, error) {
-	url := fmt.Sprintf("https://hub.docker.com/v2/namespaces/library/repositories/%s/tags", repository)
+func FindImagesFunc(ctx context.Context, opts FindOptions) FindFunc {
+	url := fmt.Sprintf(
+		"https://hub.docker.com/v2/namespaces/library/repositories/%s/tags?page=%d&page_size=%d",
+		opts.Name, opts.Page, opts.PageSize,
+	)
+	return nextFindFunc(ctx, opts.Name, url)
+}
 
-	req, err := http.NewRequest("GET", url, nil)
+func fetchImages(ctx context.Context, repository, url string) ([]Image, string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, "", fmt.Errorf("failed to create request: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
+		return nil, "", fmt.Errorf("failed to send request: %w", err)
 	}
 
 	var findResult = struct {
@@ -113,7 +107,7 @@ func fetchImages(repository string) ([]Image, error) {
 
 	// Decode the response body into the findResult variable.
 	if err := json.NewDecoder(resp.Body).Decode(&findResult); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, "", fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	// Create a slice of Image objects to return.
@@ -130,25 +124,5 @@ func fetchImages(repository string) ([]Image, error) {
 		})
 	}
 
-	return images, nil
-}
-
-func filterImages(images []Image, opts FindOptions) []Image {
-	// Create a slice to hold the filtered images.
-	var filtered []Image
-
-	// Iterate over the images and add the ones that match the options to the filtered slice.
-	for _, img := range images {
-		if opts.Tag != "" && strings.Contains(img.Tag, opts.Tag) {
-			continue
-		}
-
-		if !img.Created.After(opts.After) {
-			continue
-		}
-
-		filtered = append(filtered, img)
-	}
-
-	return filtered[:min(opts.Limit, len(filtered))]
+	return images, findResult.Next, nil
 }
